@@ -372,6 +372,9 @@ func TestPrivacyFilter(t *testing.T) {
 		{"x@shop.com", "Order 123456 shipped", "", false},
 		{"x@hotpot.com", "Hotpot menu", "", false},
 		{"bob@example.com", "Lunch?", "", false},
+		{"x@acme.com", "Acme", "Your code: 482193", true},          // the code only in the body
+		{"x@acme.com", "Acme", "Use this login link to continue", true},
+		{"bob@example.com", "Notes", "The meeting is at 1530 in room 4", false},
 	} {
 		if got, _ := p.hidden(c.from, c.subject, c.body); got != c.hidden {
 			t.Errorf("%q / %q: hidden=%v, want %v", c.from, c.subject, got, c.hidden)
@@ -563,5 +566,33 @@ func TestRevealBatch(t *testing.T) {
 	}
 	if strings.Contains(string(got), "222222") {
 		t.Fatalf("an unticked email was revealed: %s", got)
+	}
+}
+
+// The privacy filter can't be sidestepped through the body: a short preview or a content search must not
+// reveal a code that only the body carries.
+func TestPrivateBodyCantBeProbed(t *testing.T) {
+	x, h, addr, _ := setup(t)
+	deliver(t, addr, "INBOX", "From: shop@acme.example\nTo: me@icloud.com\nSubject: Acme\nMessage-ID: <a1@x>\n\n482193\n\nThis is your verification code for Acme.\n")
+	all, err := x.doRead(h, readPayload{Op: "search", Search: &searchQuery{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var uid uint32
+	for _, m := range all.(map[string]any)["messages"].([]summary) {
+		uid = m.UID
+	}
+	out, err := x.doRead(h, readPayload{Op: "read", Read: &readIn{UID: uid, MaxChars: 8}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := json.Marshal(out); strings.Contains(string(b), "4821") {
+		t.Fatalf("short preview leaked the code: %s", b)
+	}
+	for _, q := range []string{"code is", "4821", "482193"} {
+		res, _ := x.doRead(h, readPayload{Op: "search", Search: &searchQuery{Text: q}})
+		if b, _ := json.Marshal(res); strings.Contains(string(b), `"uid"`) {
+			t.Fatalf("content search %q found the private email: %s", q, b)
+		}
 	}
 }

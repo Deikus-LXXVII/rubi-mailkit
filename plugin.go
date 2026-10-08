@@ -264,7 +264,18 @@ func (x *integration) doRead(h host, r readPayload) (any, error) {
 		out := make([]summary, 0, len(msgs))
 		hiddenCount := 0
 		for _, m := range msgs {
-			if hidden, _ := p.hidden(m.From, m.Subject, ""); hidden {
+			hidden, _ := p.hidden(m.From, m.Subject, "")
+			if !hidden && byContent && p.any() {
+				// The server matched the query against the body, which the headers alone don't show: a
+				// private body must not be found piece by piece ("code is 4", "code is 48", ...).
+				hidden = true
+				if raw, err := fetchRaw(c, q.Mailbox, m.UID); err == nil {
+					if full, err := parseMessage(raw, 0); err == nil {
+						hidden, _ = p.hidden(m.From, m.Subject, full.Text)
+					}
+				}
+			}
+			if hidden {
 				hiddenCount++
 				if byContent {
 					continue
@@ -286,7 +297,9 @@ func (x *integration) doRead(h host, r readPayload) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		m, err := parseMessage(raw, r.Read.MaxChars)
+		// The filter sees the whole text; only what is shown is cut to max_chars. Filtering the cut text
+		// would let a short preview slip a code past it.
+		m, err := parseMessage(raw, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -294,6 +307,7 @@ func (x *integration) doRead(h host, r readPayload) (any, error) {
 			return map[string]any{"status": "private", "uid": r.Read.UID, "mailbox": orInbox(r.Read.Mailbox),
 				"from": senderOnly(m.From), "date": m.Date, "message": privateNote()}, nil
 		}
+		m.truncate(r.Read.MaxChars)
 		m.UID, m.Mailbox = r.Read.UID, orInbox(r.Read.Mailbox)
 		return map[string]any{"message": m}, nil
 	}

@@ -376,13 +376,18 @@ func parseMessage(raw []byte, maxChars int) (*message, error) {
 		m.Text = htmlText
 	}
 	m.Text = strings.TrimSpace(strings.ReplaceAll(m.Text, "\r\n", "\n"))
+	m.truncate(maxChars)
+	return m, nil
+}
+
+// truncate cuts the text to maxChars (at most 20000).
+func (m *message) truncate(maxChars int) {
 	if maxChars <= 0 || maxChars > 20000 {
 		maxChars = 20000
 	}
 	if r := []rune(m.Text); len(r) > maxChars {
 		m.Text, m.Truncated = string(r[:maxChars]), true
 	}
-	return m, nil
 }
 
 func headerAddrs(h mail.Header, key string) string {

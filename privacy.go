@@ -29,7 +29,9 @@ var (
 		"verification code", "security code", "confirmation code", "login code", "log-in code", "sign-in code",
 		"sign in code", "authentication code", "access code", "one-time code", "one-time password",
 		"one time password", "one-time passcode", "passcode", "otp", "2fa", "two-factor", "two-step",
-		"magic link", "verify your email", "confirm your email", "verify your identity",
+		"magic link", "verify your email", "confirm your email", "verify your identity", "login link", "log-in link",
+		"sign-in link", "sign in link", "your code", "security key", "recovery code", "backup code", "verify it's you",
+		"ваш код", "код безопасности", "ссылка для входа", "резервный код",
 		"код подтверждения", "код для входа", "код входа", "проверочный код", "одноразовый код",
 		"одноразовый пароль", "код доступа", "код авторизации", "подтверждение входа", "подтвердите адрес",
 		"подтвердите почту",
@@ -76,9 +78,16 @@ func (p privacyConfig) hidden(from, subject, body string) (bool, string) {
 		if anyPhrase(subj, bodyL, codePhrases) {
 			return true, "sign-in code or confirmation link"
 		}
-		// "123456 is your code", "Ваш код: 4821"
-		if codeWord.MatchString(subj) && codeDigits.MatchString(subj) {
-			return true, "sign-in code or confirmation link"
+		// "123456 is your code", "Ваш код: 4821", in the subject or the opening lines of the body (where
+		// such mail puts the code under an innocent subject, "Acme" / "Your code: 482193").
+		head := bodyL
+		if r := []rune(head); len(r) > 300 {
+			head = string(r[:300])
+		}
+		for _, t := range []string{subj, head} {
+			if codeWord.MatchString(t) && codeDigits.MatchString(t) {
+				return true, "sign-in code or confirmation link"
+			}
 		}
 	}
 	if p.HideResets && anyPhrase(subj, bodyL, resetPhrases) {
@@ -88,6 +97,11 @@ func (p privacyConfig) hidden(from, subject, body string) (bool, string) {
 		return true, "sign-in alert"
 	}
 	return false, ""
+}
+
+// any reports whether the filter can hide anything at all.
+func (p privacyConfig) any() bool {
+	return p.HideCodes || p.HideResets || p.HideAlerts || len(p.Senders) > 0 || len(p.Keywords) > 0
 }
 
 func anyPhrase(subj, body string, phrases []string) bool {
