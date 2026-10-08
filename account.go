@@ -2,6 +2,8 @@ package mailkit
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -98,7 +100,13 @@ func (a *account) Settings(v any) error               { return a.b.SettingsFor(a
 func (a *account) Secret(key string) (string, error)  { return a.b.SecretFor(a.id, key) }
 func (a *account) Config(v any) error                 { return a.b.ConfigFor(a.id, v) }
 func (a *account) Level(kind string) rubiplugin.Level { return a.b.Level(kind) }
-func (a *account) Logf(format string, args ...any)    { a.b.Logf("["+a.label+"] "+format, args...) }
+
+// Logf writes to the plugin's log, a plain file on disk: accounts appear there by a short code, not by
+// their address or name.
+func (a *account) Logf(format string, args ...any) {
+	sum := sha256.Sum256([]byte(a.id))
+	a.b.Logf("[account "+hex.EncodeToString(sum[:3])+"] "+format, args...)
+}
 func (a *account) Emit(typ string, data map[string]any) (string, error) {
 	return a.EmitTo("", typ, data)
 }

@@ -372,7 +372,7 @@ func TestPrivacyFilter(t *testing.T) {
 		{"x@shop.com", "Order 123456 shipped", "", false},
 		{"x@hotpot.com", "Hotpot menu", "", false},
 		{"bob@example.com", "Lunch?", "", false},
-		{"x@acme.com", "Acme", "Your code: 482193", true},          // the code only in the body
+		{"x@acme.com", "Acme", "Your code: 482193", true}, // the code only in the body
 		{"x@acme.com", "Acme", "Use this login link to continue", true},
 		{"bob@example.com", "Notes", "The meeting is at 1530 in room 4", false},
 	} {
