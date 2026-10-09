@@ -1,8 +1,9 @@
 module github.com/Deikus-LXXVII/rubi-mailkit
 
 go 1.26.4
+
 require (
-	github.com/Deikus-LXXVII/rubi v0.4.1
+	github.com/Deikus-LXXVII/rubi v0.6.0
 	github.com/emersion/go-imap/v2 v2.0.0-beta.8
 	github.com/emersion/go-message v0.18.2
 )
