@@ -11,6 +11,9 @@ SMTP, and behave the same way:
 - a privacy filter (sign-in codes, password resets, chosen senders and words) the agent can't see past
   without the user's passkey or password;
 - folder access: all folders or only some, and whether the agent may ask for the others;
+- the formatted version on request (`read` with `format: "html"`): the links with their text and a copy of
+  the email that loads nothing from the internet (no tracking images), for buttons like "Unsubscribe"
+  that plain text loses; mailing lists also show the sender's own unsubscribe address (List-Unsubscribe);
 - attachments: the agent may open them freely, may ask (the user approves each), or can't open them at
   all and sees only how many there are; attachments of private mail always need approval. An opened
   attachment is a file in a private folder, deleted after 30 minutes;

@@ -164,7 +164,7 @@ func (x *integration) openAttachment(h host, in attachmentIn) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	dir, err := attachmentDir()
+	dir, err := privateDir("attachments", attachmentTTL)
 	if err != nil {
 		return nil, err
 	}
@@ -218,16 +218,17 @@ func attachmentBody(raw []byte, index int) ([]byte, error) {
 	}
 }
 
-// attachmentDir makes a fresh private folder under the plugin's home, removing ones left by a restart.
-func attachmentDir() (string, error) {
+// privateDir makes a fresh private folder under the plugin's home (in kind), removing ones older than
+// ttl that a restart left behind.
+func privateDir(kind string, ttl time.Duration) (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	root := filepath.Join(home, "attachments")
+	root := filepath.Join(home, kind)
 	if entries, err := os.ReadDir(root); err == nil {
 		for _, e := range entries {
-			if info, err := e.Info(); err == nil && time.Since(info.ModTime()) > attachmentTTL {
+			if info, err := e.Info(); err == nil && time.Since(info.ModTime()) > ttl {
 				os.RemoveAll(filepath.Join(root, e.Name()))
 			}
 		}

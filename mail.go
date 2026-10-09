@@ -338,8 +338,14 @@ type message struct {
 	Truncated   bool         `json:"truncated"`
 	Attachments []attachment `json:"attachments"`
 	// AttachmentsHidden counts attachments the user doesn't let the agent see (setting "never").
-	AttachmentsHidden int    `json:"attachments_hidden,omitempty"`
-	Note              string `json:"note"`
+	AttachmentsHidden int `json:"attachments_hidden,omitempty"`
+	// Unsubscribe is the sender's own way out of a mailing list (List-Unsubscribe); OneClick means one
+	// POST to its web address does it.
+	Unsubscribe []string `json:"unsubscribe,omitempty"`
+	OneClick    bool     `json:"unsubscribe_one_click,omitempty"`
+	HasHTML     bool     `json:"has_formatted_version,omitempty"`
+	Note        string   `json:"note"`
+	html        string   // the HTML body, for format "html"
 }
 
 type attachment struct {
@@ -367,6 +373,7 @@ func parseMessage(raw []byte, maxChars int) (*message, error) {
 		m.MessageID = "<" + id + ">"
 	}
 	m.References = h.Get("References")
+	m.Unsubscribe, m.OneClick = listUnsubscribe(h.Get("List-Unsubscribe"), h.Get("List-Unsubscribe-Post"))
 
 	var plain, htmlText string
 	for {
@@ -385,7 +392,8 @@ func parseMessage(raw []byte, maxChars int) (*message, error) {
 			case ct == "text/plain" && plain == "":
 				plain = string(body)
 			case ct == "text/html" && htmlText == "":
-				htmlText = htmlToText(string(body))
+				m.html = string(body)
+				htmlText = htmlToText(m.html)
 			}
 		case *mail.AttachmentHeader:
 			name, _ := ph.Filename()
@@ -394,6 +402,7 @@ func parseMessage(raw []byte, maxChars int) (*message, error) {
 			m.Attachments = append(m.Attachments, attachment{Filename: name, ContentType: ct, Size: int(n)})
 		}
 	}
+	m.HasHTML = m.html != ""
 	m.Text = plain
 	if m.Text == "" {
 		m.Text = htmlText

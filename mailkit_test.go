@@ -667,3 +667,43 @@ func TestAttachmentSettings(t *testing.T) {
 		t.Fatalf("read with attachments closed: %s", b)
 	}
 }
+
+const newsletter = "From: News <news@shop.example>\nTo: me@icloud.com\nSubject: Spring sale\nMessage-ID: <n1@x>\n" +
+	"List-Unsubscribe: <mailto:unsub@shop.example>, <https://shop.example/u/123>\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\n" +
+	"MIME-Version: 1.0\nContent-Type: multipart/alternative; boundary=B\n\n" +
+	"--B\nContent-Type: text/plain\n\nBig sale this week.\n" +
+	"--B\nContent-Type: text/html\n\n<html><head><meta http-equiv=\"refresh\" content=\"0;url=https://evil.example\"></head>" +
+	"<body><p>Big sale</p><img src=\"https://track.example/p.gif?u=me\"><a href=\"https://shop.example/unsubscribe?u=1\">Unsubscribe</a> " +
+	"<a href=\"javascript:alert(1)\">x</a></body></html>\n--B--\n"
+
+// The formatted version: links with their text, and a copy that loads nothing from the internet.
+func TestFormattedVersion(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	x, h, addr, _ := setup(t)
+	deliver(t, addr, "INBOX", newsletter)
+	all, _ := x.doRead(h, readPayload{Op: "search", Search: &searchQuery{}})
+	uid := all.(map[string]any)["messages"].([]summary)[0].UID
+
+	plain, _ := x.doRead(h, readPayload{Op: "read", Read: &readIn{UID: uid}})
+	m := plain.(map[string]any)["message"].(*message)
+	if !m.HasHTML || !m.OneClick || len(m.Unsubscribe) != 2 || m.Unsubscribe[1] != "https://shop.example/u/123" {
+		t.Fatalf("text read: %+v", m)
+	}
+	out, err := x.doRead(h, readPayload{Op: "read", Read: &readIn{UID: uid, Format: "html"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := out.(map[string]any)
+	links := res["links"].([]link)
+	if len(links) != 1 || links[0].Text != "Unsubscribe" || links[0].URL != "https://shop.example/unsubscribe?u=1" {
+		t.Fatalf("links: %+v", links)
+	}
+	b, err := os.ReadFile(res["html_file"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := string(b)
+	if !strings.HasPrefix(page, "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'") || strings.Contains(page, "refresh") {
+		t.Fatalf("unsafe copy: %s", page)
+	}
+}
