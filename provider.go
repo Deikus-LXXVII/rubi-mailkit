@@ -55,7 +55,7 @@ const PublisherKey = "MCowBQYDK2VwAyEAxeDfKAkO77JdARN7Y2jJT3tXw9mN+GqqH8R5mhcxt8
 // prov is the provider this binary serves; set by Main (and by tests).
 var prov Provider
 
-var kindRead, kindDraft, kindSend, kindWatch, kindPrivate, kindFolder string
+var kindRead, kindDraft, kindSend, kindWatch, kindPrivate, kindFolder, kindAttachment string
 
 func use(p Provider) {
 	if p.CleanPassword == nil {
@@ -64,6 +64,7 @@ func use(p Provider) {
 	prov = p
 	kindRead, kindDraft, kindSend = p.ID+".read", p.ID+".draft", p.ID+".send"
 	kindWatch, kindPrivate, kindFolder = p.ID+".watch", p.ID+".private", p.ID+".folder"
+	kindAttachment = p.ID + ".attachment"
 	defaultIMAPAddr, defaultSMTPAddr = p.IMAPAddr, p.SMTPAddr
 }
 
@@ -107,12 +108,14 @@ func manifest() rubiplugin.Manifest {
 			{Kind: kindPrivate, Title: "Show a private email", DefaultLevel: rubiplugin.Strong, Locked: true,
 				Options: []rubiplugin.Option{{Key: "show", Label: "Show it to my agent"}}},
 			{Kind: kindFolder, Title: "Open a closed folder for a while", DefaultLevel: rubiplugin.Strong, Locked: true},
+			{Kind: kindAttachment, Title: "Give an attachment to your agent", DefaultLevel: rubiplugin.Strong, Locked: true,
+				Options: []rubiplugin.Option{{Key: "show", Label: "Give it to my agent"}}},
 		},
 		Events: []rubiplugin.EventType{
 			{Type: "reply", Untrusted: []string{"reply.from", "reply.subject"}},
 			{Type: "watch", Untrusted: []string{"message.from", "message.subject", "message.snippet"}},
 		},
-		Config: append(append([]rubiplugin.ConfigField{}, folderSettings...),
+		Config: append(append([]rubiplugin.ConfigField{}, folderSettings...), attachmentSetting,
 			rubiplugin.ConfigField{Key: "hide_codes", Label: "Hide sign-in codes, one-time passwords and confirmation links", Type: "bool", Default: true,
 				Help: "Built-in list, English and Russian, plus subjects like \"482913 is your code\"."},
 			rubiplugin.ConfigField{Key: "hide_password_resets", Label: "Hide password reset emails", Type: "bool", Default: true},

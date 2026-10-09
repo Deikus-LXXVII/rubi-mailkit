@@ -337,7 +337,9 @@ type message struct {
 	Text        string       `json:"text"`
 	Truncated   bool         `json:"truncated"`
 	Attachments []attachment `json:"attachments"`
-	Note        string       `json:"note"`
+	// AttachmentsHidden counts attachments the user doesn't let the agent see (setting "never").
+	AttachmentsHidden int    `json:"attachments_hidden,omitempty"`
+	Note              string `json:"note"`
 }
 
 type attachment struct {

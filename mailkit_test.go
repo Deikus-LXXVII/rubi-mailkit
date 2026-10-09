@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -594,5 +595,75 @@ func TestPrivateBodyCantBeProbed(t *testing.T) {
 		if b, _ := json.Marshal(res); strings.Contains(string(b), `"uid"`) {
 			t.Fatalf("content search %q found the private email: %s", q, b)
 		}
+	}
+}
+
+const withAttachment = "From: anna@example.com\nTo: me@icloud.com\nSubject: The contract\nMessage-ID: <a1@x>\n" +
+	"MIME-Version: 1.0\nContent-Type: multipart/mixed; boundary=B\n\n" +
+	"--B\nContent-Type: text/plain\n\nSee the attached file.\n" +
+	"--B\nContent-Type: text/plain; name=\"contract.txt\"\nContent-Disposition: attachment; filename=\"../contract.txt\"\n\nTerms: pay 100.\n" +
+	"--B--\n"
+
+// The user chooses whether attachments open freely, after their approval, or not at all.
+func TestAttachmentSettings(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	x, h, addr, _ := setup(t)
+	deliver(t, addr, "INBOX", withAttachment)
+	all, _ := x.doRead(h, readPayload{Op: "search", Search: &searchQuery{}})
+	uid := all.(map[string]any)["messages"].([]summary)[0].UID
+
+	// Default: ask. The agent must say why; the user approves; then it gets the file.
+	if _, err := x.requestAttachment(context.Background(), h, attachmentIn{UID: uid, Index: 1}); err == nil {
+		t.Fatal("asked without a reason")
+	}
+	res, err := x.requestAttachment(context.Background(), h, attachmentIn{UID: uid, Index: 1, Reason: "summarize the contract"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := json.Marshal(res); strings.Contains(string(b), "pay 100") {
+		t.Fatalf("content given before approval: %s", b)
+	}
+	last := h.pending[len(h.pending)-1]
+	if last.Kind != kindAttachment {
+		t.Fatalf("request: %+v", last)
+	}
+	payload, _ := json.Marshal(last.Payload)
+	var in attachmentIn
+	_ = json.Unmarshal(payload, &in)
+	got, err := x.openAttachment(h, in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := got.(map[string]any)
+	path := out["file"].(string)
+	if b, err := os.ReadFile(path); err != nil || !strings.Contains(string(b), "pay 100") || filepath.Base(path) != "contract.txt" {
+		t.Fatalf("file %s: %v %q", path, err, b)
+	}
+	if st, _ := os.Stat(filepath.Dir(path)); st.Mode().Perm() != 0o700 {
+		t.Fatalf("folder mode %v", st.Mode().Perm())
+	}
+
+	// Free: at once, no approval.
+	if h.config == nil {
+		h.config = map[string]any{}
+	}
+	h.config["attachments"] = "free"
+	n := len(h.pending)
+	if got, err := x.requestAttachment(context.Background(), h, attachmentIn{UID: uid, Name: "../contract.txt"}); err != nil ||
+		!strings.Contains(got.(map[string]any)["text"].(string), "pay 100") || len(h.pending) != n {
+		t.Fatalf("free: %v %v", got, err)
+	}
+
+	// Never: refused, and the agent sees only how many there are.
+	h.config["attachments"] = "never"
+	if _, err := x.requestAttachment(context.Background(), h, attachmentIn{UID: uid, Index: 1, Reason: "x"}); err == nil {
+		t.Fatal("opened while closed")
+	}
+	if _, err := x.openAttachment(h, in); err == nil {
+		t.Fatal("an approval from before the setting changed still opened it")
+	}
+	read, _ := x.doRead(h, readPayload{Op: "read", Read: &readIn{UID: uid}})
+	if b, _ := json.Marshal(read); strings.Contains(string(b), "contract.txt") || !strings.Contains(string(b), `"attachments_hidden":1`) {
+		t.Fatalf("read with attachments closed: %s", b)
 	}
 }

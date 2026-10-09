@@ -11,6 +11,9 @@ SMTP, and behave the same way:
 - a privacy filter (sign-in codes, password resets, chosen senders and words) the agent can't see past
   without the user's passkey or password;
 - folder access: all folders or only some, and whether the agent may ask for the others;
+- attachments: the agent may open them freely, may ask (the user approves each), or can't open them at
+  all and sees only how many there are; attachments of private mail always need approval. An opened
+  attachment is a file in a private folder, deleted after 30 minutes;
 - several accounts: every tool takes an optional `account` (the address), the default one otherwise.
   Folder access is set per account; the privacy filter applies to all of them.
 
