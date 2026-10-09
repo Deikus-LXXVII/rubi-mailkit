@@ -2,6 +2,7 @@ package mailkit
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
@@ -19,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Deikus-LXXVII/rubi/sdk/rubiplugin"
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 	_ "github.com/emersion/go-message/charset" // decode non-UTF-8 messages
@@ -51,7 +53,24 @@ func defaultSettings() Settings {
 // Seams for tests.
 var (
 	dialIMAP = func(addr string) (*imapclient.Client, error) {
-		return imapclient.DialTLS(addr, &imapclient.Options{Dialer: &net.Dialer{Timeout: 20 * time.Second}})
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			return nil, err
+		}
+		// Through the machine's egress proxy when it has one (some agent machines let only port 443 out
+		// directly); TLS still runs end to end with the mail server, checked as usual.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		conn, err := rubiplugin.Dial(ctx, addr)
+		if err != nil {
+			return nil, err
+		}
+		tc := tls.Client(conn, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+		if err := tc.HandshakeContext(ctx); err != nil {
+			conn.Close()
+			return nil, err
+		}
+		return imapclient.New(tc, nil), nil
 	}
 	sendMail = smtpSend
 )
@@ -87,7 +106,9 @@ func smtpSend(addr, user, password, from string, to []string, msg []byte) error 
 	if err != nil {
 		return err
 	}
-	conn, err := net.DialTimeout("tcp", addr, 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	conn, err := rubiplugin.Dial(ctx, addr)
+	cancel()
 	if err != nil {
 		return fmt.Errorf("can't reach the %s server: %w", prov.Name, err)
 	}
