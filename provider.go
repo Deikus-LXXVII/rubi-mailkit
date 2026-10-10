@@ -43,6 +43,9 @@ type Provider struct {
 	// SavesSent is true when the server files mail sent over SMTP in Sent by itself (Gmail); otherwise
 	// the plugin appends a copy.
 	SavesSent bool
+	// Gmail is true for Gmail's servers: searches run with Gmail's own search (X-GM-RAW), and labels are
+	// managed as Gmail exposes them over IMAP (a label is a folder; a message can be in several).
+	Gmail bool
 	// MailDomain is used in Message-IDs when the address has none.
 	MailDomain string
 	// AuthError is shown when the server rejects the login.
@@ -56,6 +59,7 @@ const PublisherKey = "MCowBQYDK2VwAyEAxeDfKAkO77JdARN7Y2jJT3tXw9mN+GqqH8R5mhcxt8
 var prov Provider
 
 var kindRead, kindDraft, kindSend, kindWatch, kindPrivate, kindFolder, kindAttachment string
+var kindOrganize, kindFolders, kindFolderDelete string
 
 func use(p Provider) {
 	if p.CleanPassword == nil {
@@ -65,6 +69,7 @@ func use(p Provider) {
 	kindRead, kindDraft, kindSend = p.ID+".read", p.ID+".draft", p.ID+".send"
 	kindWatch, kindPrivate, kindFolder = p.ID+".watch", p.ID+".private", p.ID+".folder"
 	kindAttachment = p.ID + ".attachment"
+	kindOrganize, kindFolders, kindFolderDelete = p.ID+".organize", p.ID+".folders", p.ID+".folder_delete"
 	defaultIMAPAddr, defaultSMTPAddr = p.IMAPAddr, p.SMTPAddr
 }
 
@@ -105,6 +110,9 @@ func manifest() rubiplugin.Manifest {
 			{Kind: kindDraft, Title: "Save drafts", DefaultLevel: rubiplugin.None},
 			{Kind: kindSend, Title: "Send email", DefaultLevel: rubiplugin.Strong, Options: sendOptions},
 			{Kind: kindWatch, Title: "Watch for new mail (wakes your agent)", DefaultLevel: rubiplugin.None},
+			{Kind: kindOrganize, Title: organizeTitle(), DefaultLevel: rubiplugin.None},
+			{Kind: kindFolders, Title: "Create and rename " + folderWord() + "s", DefaultLevel: rubiplugin.None},
+			{Kind: kindFolderDelete, Title: "Delete a " + folderWord(), DefaultLevel: rubiplugin.Strong},
 			{Kind: kindPrivate, Title: "Show a private email", DefaultLevel: rubiplugin.Strong, Locked: true,
 				Options: []rubiplugin.Option{{Key: "show", Label: "Show it to my agent"}}},
 			{Kind: kindFolder, Title: "Open a closed folder for a while", DefaultLevel: rubiplugin.Strong, Locked: true},
@@ -128,4 +136,18 @@ func manifest() rubiplugin.Manifest {
 		),
 		Egress: []string{p.IMAPAddr, p.SMTPAddr},
 	}
+}
+
+func folderWord() string {
+	if prov.Gmail {
+		return "label"
+	}
+	return "folder"
+}
+
+func organizeTitle() string {
+	if prov.Gmail {
+		return "Organize mail: archive, trash, spam, labels, read and star marks (can be undone)"
+	}
+	return "Organize mail: archive, trash, spam, move, read and flag marks (can be undone)"
 }

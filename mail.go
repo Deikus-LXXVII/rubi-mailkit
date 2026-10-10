@@ -11,7 +11,6 @@ import (
 	"html"
 	"io"
 	"mime"
-	"mime/quotedprintable"
 	"net"
 	netmail "net/mail"
 	"net/smtp"
@@ -53,27 +52,39 @@ func defaultSettings() Settings {
 // Seams for tests.
 var (
 	dialIMAP = func(addr string) (*imapclient.Client, error) {
-		host, _, err := net.SplitHostPort(addr)
+		conn, err := dialTLS(addr)
 		if err != nil {
 			return nil, err
 		}
-		// Through the machine's egress proxy when it has one (some agent machines let only port 443 out
-		// directly); TLS still runs end to end with the mail server, checked as usual.
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		conn, err := rubiplugin.Dial(ctx, addr)
-		if err != nil {
-			return nil, err
-		}
-		tc := tls.Client(conn, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
-		if err := tc.HandshakeContext(ctx); err != nil {
-			conn.Close()
-			return nil, err
-		}
-		return imapclient.New(tc, nil), nil
+		return imapclient.New(conn, nil), nil
 	}
+	// dialRaw opens a plain connection to the IMAP server for commands go-imap doesn't speak (Gmail's
+	// X-GM-RAW search).
+	dialRaw  = dialTLS
 	sendMail = smtpSend
 )
+
+// dialTLS connects to an implicit-TLS server, through the machine's egress proxy when it has one (some
+// agent machines let only port 443 out directly); TLS still runs end to end with the mail server, checked
+// as usual.
+func dialTLS(addr string) (net.Conn, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	conn, err := rubiplugin.Dial(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+	tc := tls.Client(conn, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+	if err := tc.HandshakeContext(ctx); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return tc, nil
+}
 
 // errAuth is returned when the server rejects the login.
 var errAuth = errors.New("login rejected")
@@ -170,7 +181,7 @@ func listMailboxes(c *imapclient.Client) ([]mailbox, error) {
 			case imap.MailboxAttrNoSelect, imap.MailboxAttrNonExistent:
 				skip = true
 			case imap.MailboxAttrDrafts, imap.MailboxAttrSent, imap.MailboxAttrTrash, imap.MailboxAttrJunk,
-				imap.MailboxAttrArchive:
+				imap.MailboxAttrArchive, imap.MailboxAttrAll, imap.MailboxAttrFlagged:
 				attrs = append(attrs, strings.TrimPrefix(string(a), "\\"))
 			}
 		}
@@ -199,7 +210,8 @@ func detectSpecial(boxes []mailbox, s *Settings) {
 // ---- search & read ----
 
 type searchQuery struct {
-	Mailbox    string `json:"mailbox,omitempty" jsonschema:"folder, default INBOX"`
+	Query      string `json:"query,omitempty" jsonschema:"a search in Gmail syntax, e.g. from:anna is:unread newer_than:7d -label:work; see the tool description"`
+	Mailbox    string `json:"mailbox,omitempty" jsonschema:"folder, or inbox, sent, drafts, archive, trash, spam. Default: INBOX; with query, all mail"`
 	From       string `json:"from,omitempty"`
 	To         string `json:"to,omitempty"`
 	Subject    string `json:"subject,omitempty"`
@@ -213,22 +225,36 @@ type searchQuery struct {
 
 type summary struct {
 	UID     uint32 `json:"uid"`
+	Mailbox string `json:"mailbox,omitempty"`
 	Date    string `json:"date,omitempty"`
 	From    string `json:"from"`
 	To      string `json:"to,omitempty"`
 	Subject string `json:"subject"`
 	Seen    bool   `json:"seen"`
+	Starred bool   `json:"starred,omitempty"`
 	Private bool   `json:"private,omitempty"` // hidden by the user's privacy filter: only the sender is shown
+	Thread  int    `json:"thread,omitempty"`  // which of the threads it belongs to (1 = the first)
+
+	info threadInfo
 }
 
 func search(c *imapclient.Client, q searchQuery) ([]summary, error) {
-	box := q.Mailbox
-	if box == "" {
-		box = "INBOX"
+	crit, err := q.criteria()
+	if err != nil {
+		return nil, err
 	}
-	if _, err := c.Select(box, &imap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
-		return nil, fmt.Errorf("can't open folder %q: %w", box, err)
+	return searchBox(c, orInbox(q.Mailbox), crit, q.limit())
+}
+
+func (q searchQuery) limit() int {
+	if q.Limit <= 0 {
+		return 20
 	}
+	return min(q.Limit, 50)
+}
+
+// criteria translates the separate filters (from, subject, …).
+func (q searchQuery) criteria() (*imap.SearchCriteria, error) {
 	crit := &imap.SearchCriteria{}
 	for k, v := range map[string]string{"From": q.From, "To": q.To, "Subject": q.Subject} {
 		if v != "" {
@@ -253,37 +279,57 @@ func search(c *imapclient.Client, q searchQuery) ([]summary, error) {
 	if q.UnseenOnly {
 		crit.NotFlag = []imap.Flag{imap.FlagSeen}
 	}
+	return crit, nil
+}
+
+// searchBox runs a search in one folder and returns the newest limit matches, newest first.
+func searchBox(c *imapclient.Client, box string, crit *imap.SearchCriteria, limit int) ([]summary, error) {
+	if _, err := c.Select(box, &imap.SelectOptions{ReadOnly: true}).Wait(); err != nil {
+		return nil, fmt.Errorf("can't open folder %q: %w", box, err)
+	}
 	res, err := c.UIDSearch(crit, nil).Wait()
 	if err != nil {
 		return nil, err
 	}
-	uids := res.AllUIDs()
-	limit := q.Limit
-	if limit <= 0 {
-		limit = 20
-	}
-	limit = min(limit, 50)
-	if len(uids) > limit {
+	return fetchSummaries(c, box, res.AllUIDs(), limit)
+}
+
+var refsSection = &imap.FetchItemBodySection{Specifier: imap.PartSpecifierHeader, HeaderFields: []string{"References"}, Peek: true}
+
+// fetchSummaries describes the newest limit of uids in the selected folder box, newest first.
+func fetchSummaries(c *imapclient.Client, box string, uids []imap.UID, limit int) ([]summary, error) {
+	sort.Slice(uids, func(i, j int) bool { return uids[i] < uids[j] })
+	if limit > 0 && len(uids) > limit {
 		uids = uids[len(uids)-limit:]
 	}
 	if len(uids) == 0 {
 		return []summary{}, nil
 	}
-	msgs, err := c.Fetch(imap.UIDSetNum(uids...), &imap.FetchOptions{UID: true, Envelope: true, Flags: true}).Collect()
+	msgs, err := c.Fetch(imap.UIDSetNum(uids...), &imap.FetchOptions{UID: true, Envelope: true, Flags: true,
+		BodySection: []*imap.FetchItemBodySection{refsSection}}).Collect()
 	if err != nil {
 		return nil, err
 	}
 	out := make([]summary, 0, len(msgs))
 	for _, m := range msgs {
-		s := summary{UID: uint32(m.UID)}
+		s := summary{UID: uint32(m.UID), Mailbox: box}
 		if e := m.Envelope; e != nil {
 			s.Subject, s.From, s.To = e.Subject, addrs(e.From), addrs(e.To)
 			if !e.Date.IsZero() {
 				s.Date = e.Date.Format(time.RFC3339)
 			}
+			s.info.subject = e.Subject
+			if e.MessageID != "" {
+				s.info.messageID = "<" + strings.ToLower(strings.Trim(e.MessageID, "<>")) + ">"
+			}
+			for _, id := range e.InReplyTo {
+				s.info.parents = append(s.info.parents, "<"+strings.ToLower(strings.Trim(id, "<>"))+">")
+			}
 		}
+		s.info.parents = append(s.info.parents, msgIDs(string(m.FindBodySection(refsSection)))...)
 		for _, f := range m.Flags {
 			s.Seen = s.Seen || f == imap.FlagSeen
+			s.Starred = s.Starred || f == imap.FlagFlagged
 		}
 		out = append(out, s)
 	}
@@ -334,6 +380,7 @@ type message struct {
 	Date        string       `json:"date,omitempty"`
 	MessageID   string       `json:"message_id,omitempty"`
 	References  string       `json:"-"`
+	InReplyTo   string       `json:"-"`
 	Text        string       `json:"text"`
 	Truncated   bool         `json:"truncated"`
 	Attachments []attachment `json:"attachments"`
@@ -373,6 +420,7 @@ func parseMessage(raw []byte, maxChars int) (*message, error) {
 		m.MessageID = "<" + id + ">"
 	}
 	m.References = h.Get("References")
+	m.InReplyTo = h.Get("In-Reply-To")
 	m.Unsubscribe, m.OneClick = listUnsubscribe(h.Get("List-Unsubscribe"), h.Get("List-Unsubscribe-Post"))
 
 	var plain, htmlText string
@@ -413,8 +461,12 @@ func parseMessage(raw []byte, maxChars int) (*message, error) {
 }
 
 // truncate cuts the text to maxChars (at most 20000).
+// A negative maxChars keeps the whole text (for forwarding).
 func (m *message) truncate(maxChars int) {
-	if maxChars <= 0 || maxChars > 20000 {
+	if maxChars < 0 {
+		return
+	}
+	if maxChars == 0 || maxChars > 20000 {
 		maxChars = 20000
 	}
 	if r := []rune(m.Text); len(r) > maxChars {
@@ -463,7 +515,12 @@ type draft struct {
 	Body       string   `json:"body"`
 	ReplyToUID uint32   `json:"reply_to_uid,omitempty" jsonschema:"uid of the message being answered (sets threading headers)"`
 	ReplyBox   string   `json:"reply_mailbox,omitempty" jsonschema:"folder of that message, default INBOX"`
-	Account    string   `json:"account,omitempty" jsonschema:"which connected mailbox (its address); default: the default one"`
+	HTMLBody   string   `json:"html_body,omitempty" jsonschema:"optional formatted version (HTML); body stays the plain-text version"`
+	// Attachments are files from the agent or attachments of other emails.
+	Attachments []attachIn `json:"attachments,omitempty" jsonschema:"files to attach: content_base64 from you (2 MB in all), or an attachment of another email (from_uid and index, up to 20 MB)"`
+	Account     string     `json:"account,omitempty" jsonschema:"which connected mailbox (its address); default: the default one"`
+
+	files []outFile // the attachments, resolved
 }
 
 type composed struct {
@@ -474,6 +531,7 @@ type composed struct {
 	bcc       string
 	subject   string
 	inReplyTo string
+	files     []outFile
 }
 
 func parseList(list []string) ([]*netmail.Address, error) {
@@ -546,15 +604,7 @@ func compose(s Settings, d draft, inReplyTo, references string) (*composed, erro
 	hdr("In-Reply-To", inReplyTo)
 	hdr("References", strings.TrimSpace(references+" "+inReplyTo))
 	hdr("MIME-Version", "1.0")
-	hdr("Content-Type", "text/plain; charset=utf-8")
-	hdr("Content-Transfer-Encoding", "quoted-printable")
-	b.WriteString("\r\n")
-	qp := quotedprintable.NewWriter(&b)
-	body := strings.ReplaceAll(strings.ReplaceAll(d.Body, "\r\n", "\n"), "\n", "\r\n")
-	if _, err := qp.Write([]byte(body)); err != nil {
-		return nil, err
-	}
-	if err := qp.Close(); err != nil {
+	if err := writeBody(&b, d.Body, d.HTMLBody, d.files); err != nil {
 		return nil, err
 	}
 
@@ -563,7 +613,7 @@ func compose(s Settings, d draft, inReplyTo, references string) (*composed, erro
 		env = append(env, a.Address)
 	}
 	return &composed{raw: b.Bytes(), messageID: msgID, envelope: env, to: joinAddrs(to), cc: joinAddrs(cc),
-		bcc: joinAddrs(bcc), subject: subject, inReplyTo: inReplyTo}, nil
+		bcc: joinAddrs(bcc), subject: subject, inReplyTo: inReplyTo, files: d.files}, nil
 }
 
 func appendMessage(c *imapclient.Client, box string, flags []imap.Flag, raw []byte) error {

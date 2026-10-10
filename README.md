@@ -17,6 +17,21 @@ SMTP, and behave the same way:
 - attachments: the agent may open them freely, may ask (the user approves each), or can't open them at
   all and sees only how many there are; attachments of private mail always need approval. An opened
   attachment is a file in a private folder, deleted after 30 minutes;
+- search in Gmail's syntax (`from:anna is:unread larger:5M newer_than:7d "exact phrase" -label:work`,
+  `OR`): Gmail runs the query itself (X-GM-RAW), so every Gmail operator works there; other servers get
+  the common operators translated, across every folder except Trash and Spam. Results come grouped into
+  threads, and `thread` reads a whole conversation (from the inbox, Sent and the archive) at once;
+- organizing: archive, trash, spam, move, Gmail labels, read and star marks, creating, renaming and
+  deleting folders or labels. Everything but deleting a folder can be undone for 7 days; deleting a
+  folder always asks the user, and on servers where that deletes mail only an empty folder can go.
+  Mail hidden by the privacy filter is never touched;
+- forwarding with the original's attachments, attachments when sending (base64 from the agent, or
+  attachments of other emails; the plugin never reads a file path the agent names), a formatted (HTML)
+  version, and `read` with `format: "raw"` for the source (every header, the MIME structure; attachment
+  contents stay behind the attachment setting). Attachments the agent can't open only go out when the
+  user reviews the email or it is a draft;
+- drafts: list, edit (the old version goes to the trash), delete, and send a saved draft (also one the
+  user wrote) after approval;
 - several accounts: every tool takes an optional `account` (the address), the default one otherwise.
   Folder access is set per account; the privacy filter applies to all of them.
 

@@ -50,6 +50,9 @@ func startIMAP(t *testing.T) string {
 		_ = u.Create("INBOX", nil)
 		_ = u.Create("Drafts", &imap.CreateOptions{SpecialUse: []imap.MailboxAttr{imap.MailboxAttrDrafts}})
 		_ = u.Create("Sent Messages", &imap.CreateOptions{SpecialUse: []imap.MailboxAttr{imap.MailboxAttrSent}})
+		_ = u.Create("Deleted Messages", &imap.CreateOptions{SpecialUse: []imap.MailboxAttr{imap.MailboxAttrTrash}})
+		_ = u.Create("Junk", &imap.CreateOptions{SpecialUse: []imap.MailboxAttr{imap.MailboxAttrJunk}})
+		_ = u.Create("Archive", &imap.CreateOptions{SpecialUse: []imap.MailboxAttr{imap.MailboxAttrArchive}})
 		mem.AddUser(u)
 	}
 	srv := imapserver.New(&imapserver.Options{
@@ -514,7 +517,7 @@ func TestFolderAccess(t *testing.T) {
 		t.Fatalf("closed folder: %v", err)
 	}
 	list, _ := x.doRead(h, readPayload{Op: "list"})
-	if b, _ := json.Marshal(list); !strings.Contains(string(b), `"closed":["Drafts","Sent Messages"]`) {
+	if b, _ := json.Marshal(list); !strings.Contains(string(b), `"closed":["Archive","Deleted Messages","Drafts","Junk","Sent Messages"]`) {
 		t.Fatalf("list: %s", b)
 	}
 	// After the user approves an hour of access, the folder opens.

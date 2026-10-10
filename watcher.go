@@ -42,6 +42,7 @@ type state struct {
 	Watches []*watch          `json:"watches,omitempty"`
 	Grants  []*grant          `json:"grants,omitempty"` // temporary folder access the user approved
 	Cursors map[string]cursor `json:"cursors"`
+	Undo    []*undoRec        `json:"undo,omitempty"` // how to reverse recent changes to the mailbox
 }
 
 func (s *state) active(now time.Time) []*tracked {
