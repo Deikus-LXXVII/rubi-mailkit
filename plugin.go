@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
+	netmail "net/mail"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +39,10 @@ type integration struct {
 	mu      sync.Mutex
 	stop    chan struct{}
 	pollNow chan struct{}
+	jobsNow chan struct{}
+
+	idleMu sync.Mutex
+	idlers map[string]*idler // IDLE connections by account
 }
 
 func newPlugin(x *integration) *rubiplugin.Plugin {
@@ -120,6 +126,32 @@ func newPlugin(x *integration) *rubiplugin.Plugin {
 	registerFolders(p, x)
 	registerAttachments(p, x)
 	registerManage(p, x)
+	registerRules(p, x)
+	registerUnsubscribe(p, x)
+	registerBulk(p, x)
+	registerPanel(p, x)
+	addTool(p, "respond_invite", "Answer a calendar invitation that came by email: accept, maybe or decline, with an optional note. The organizer's calendar gets the answer; the user approves it like any email.",
+		func(in inviteIn) string { return in.Account },
+		func(ctx context.Context, a *account, in inviteIn) (any, error) { return x.respondInvite(ctx, a, in) })
+	addTool(p, "cancel_send", "Stop an approved email that is still waiting to go out (undo send, or a send_at time).",
+		func(in cancelIn) string { return in.Account },
+		func(ctx context.Context, a *account, in cancelIn) (any, error) {
+			return x.cancelSend(a, strings.TrimSpace(in.SendID))
+		})
+	addTool(p, "scheduled", "Emails waiting to go out (send later, undo send) and snoozed mail.", accountOf,
+		func(ctx context.Context, a *account, _ accountIn) (any, error) { return x.scheduled(a) })
+	addTool(p, "snooze", "Put messages away until a time: they leave the inbox and come back unread at until (and you get a snooze event). Undo with "+tool("undo")+".",
+		func(in snoozeIn) string { return in.Account },
+		func(ctx context.Context, a *account, in snoozeIn) (any, error) {
+			at, err := parseWhen(in.Until, time.Now())
+			if err != nil {
+				return nil, err
+			}
+			if !at.After(time.Now()) || at.After(time.Now().AddDate(1, 0, 0)) {
+				return nil, errors.New("until must be in the future, within a year")
+			}
+			return x.manage(ctx, a, manageOp{Op: "snooze", Mailbox: in.Mailbox, UIDs: in.all(), Until: at.UTC()})
+		})
 	addTool(p, "reveal", "Ask the user to let you see emails hidden by their privacy filter (e.g. a sign-in code they want you to use). Pass uid for one, or uids for several at once: the user ticks which ones to show and approves them together with their passkey or password. You get them once. Say why in reason.",
 		func(in revealIn) string { return in.Account },
 		func(ctx context.Context, a *account, in revealIn) (any, error) { return x.requestReveal(ctx, a, in) })
@@ -149,7 +181,7 @@ func newPlugin(x *integration) *rubiplugin.Plugin {
 		if err := json.Unmarshal(payload, &m); err != nil {
 			return nil, err
 		}
-		return x.send(a, m, option == "send_track")
+		return x.deliver(a, m, option == "send_track")
 	})
 	return p
 }
@@ -180,6 +212,11 @@ func (*integration) Validate(_ context.Context, fields, secrets map[string]strin
 		return nil, "", errors.New("enter the app-specific password")
 	}
 	secrets["app_password"] = pw
+	if prov.CustomServers {
+		if err := customServers(&s, fields); err != nil {
+			return nil, "", err
+		}
+	}
 	c, err := login(s, pw)
 	if err != nil {
 		return nil, "", err
@@ -219,7 +256,18 @@ type readIn struct {
 
 type sendIn struct {
 	draft
-	TrackDays int `json:"track_days,omitempty" jsonschema:"days to watch for replies if the user picks 'Send and notify on reply' (default 14, max 60)"`
+	SendAt    string `json:"send_at,omitempty" jsonschema:"send later: 2026-10-12 09:00 (the user's time), an RFC 3339 time, or 3h / 2d; at most 30 days ahead"`
+	TrackDays int    `json:"track_days,omitempty" jsonschema:"days to watch for replies if the user picks 'Send and notify on reply' (default 14, max 60)"`
+}
+
+type cancelIn struct {
+	SendID  string `json:"send_id"`
+	Account string `json:"account,omitempty" jsonschema:"which connected mailbox (its address); default: the default one"`
+}
+
+type snoozeIn struct {
+	manageIn
+	Until string `json:"until" jsonschema:"2026-10-12 09:00 (the user's time), an RFC 3339 time, or 3h / 2d / 1w"`
 }
 
 type stopIn struct {
@@ -312,8 +360,8 @@ func (x *integration) doRead(h host, r readPayload) (any, error) {
 		queryContent := false
 		if strings.TrimSpace(q.Query) != "" {
 			msgs, queryContent, err = x.querySearch(h, c, s, q)
-		} else {
-			msgs, err = search(c, q)
+		} else if msgs, err = search(c, q); err == nil {
+			gmailMeta(h, s, orInbox(q.Mailbox), msgs)
 		}
 		if err != nil {
 			return nil, err
@@ -341,7 +389,7 @@ func (x *integration) doRead(h host, r readPayload) (any, error) {
 					continue
 				}
 				m = summary{UID: m.UID, Mailbox: m.Mailbox, Date: m.Date, From: senderOnly(m.From), Seen: m.Seen,
-					Private: true, info: threadInfo{messageID: m.info.messageID, parents: m.info.parents}}
+					Private: true, info: threadInfo{thread: m.info.thread, messageID: m.info.messageID, parents: m.info.parents}}
 			}
 			out = append(out, m)
 		}
@@ -412,10 +460,11 @@ type mailPayload struct {
 	Subject   string   `json:"subject"`
 	TrackDays int      `json:"track_days,omitempty"`
 	// A big email waits in the plugin's outbox; the approval carries its name and hash.
-	RawFile    string `json:"raw_file,omitempty"`
-	RawHash    string `json:"raw_hash,omitempty"`
-	ReplaceUID uint32 `json:"replace_uid,omitempty"` // a draft this one replaces
-	DraftUID   uint32 `json:"draft_uid,omitempty"`   // the draft being sent, removed once sent
+	RawFile    string    `json:"raw_file,omitempty"`
+	RawHash    string    `json:"raw_hash,omitempty"`
+	ReplaceUID uint32    `json:"replace_uid,omitempty"` // a draft this one replaces
+	DraftUID   uint32    `json:"draft_uid,omitempty"`   // the draft being sent, removed once sent
+	SendAt     time.Time `json:"send_at,omitzero"`      // send later
 }
 
 func payloadOf(m *composed, days int) mailPayload {
@@ -450,7 +499,7 @@ func (x *integration) prepare(h host, d *draft, draftOnly bool) (*composed, Sett
 	if d.files, err = x.resolveFiles(h, c, sp, d.Attachments, draftOnly); err != nil {
 		return nil, s, err
 	}
-	msg, err := composeReply(c, s, privacyOf(h), *d)
+	msg, err := composeReply(c, s, privacyOf(h), *d, signatureOf(h))
 	return msg, s, err
 }
 
@@ -486,7 +535,27 @@ func (x *integration) requestSend(ctx context.Context, h host, in sendIn) (any, 
 	if err != nil {
 		return nil, err
 	}
+	at, err := sendTime(in.SendAt)
+	if err != nil {
+		return nil, err
+	}
+	msg.sendAt = at
 	return x.askSend(ctx, h, s, msg, in.Body, in.TrackDays, 0)
+}
+
+func sendTime(v string) (time.Time, error) {
+	now := time.Now()
+	at, err := parseWhen(v, now)
+	if err != nil || at.IsZero() {
+		return at, err
+	}
+	if at.Before(now.Add(-time.Minute)) {
+		return at, errors.New("send_at is in the past")
+	}
+	if at.After(now.Add(maxSchedule)) {
+		return at, errors.New("send_at can be at most 30 days ahead")
+	}
+	return at.UTC(), nil
 }
 
 func orInbox(b string) string {
@@ -502,9 +571,10 @@ func privateNote() string {
 		"password, and you get it once. Don't ask for codes or passwords otherwise."
 }
 
-// composeReply builds a message, adding threading headers when it answers an existing one.
-func composeReply(c *imapclient.Client, s Settings, p privacyConfig, d draft) (*composed, error) {
-	var inReplyTo, refs string
+// composeReply builds a message, adding threading headers when it answers an existing one, the other
+// recipients for reply all, a quote of the original and the user's signature.
+func composeReply(c *imapclient.Client, s Settings, p privacyConfig, d draft, signature string) (*composed, error) {
+	var inReplyTo, refs, quote string
 	if d.ReplyToUID != 0 {
 		raw, err := fetchRaw(c, d.ReplyBox, d.ReplyToUID)
 		if err != nil {
@@ -521,8 +591,65 @@ func composeReply(c *imapclient.Client, s Settings, p privacyConfig, d draft) (*
 		if strings.TrimSpace(d.Subject) == "" {
 			d.Subject = orig.Subject
 		}
+		if len(d.To) == 0 { // answer whoever the original asks replies to go to
+			d.To = []string{orDefault(orig.ReplyTo, orig.From)}
+		}
+		if d.ReplyAll {
+			d.Cc = append(d.Cc, othersOf(s.Address, append(append(append([]string{}, d.To...), d.Cc...), d.Bcc...), orig.From, orig.To, orig.Cc)...)
+		}
+		if d.Quote {
+			var q strings.Builder
+			for _, l := range strings.Split(orig.Text, "\n") {
+				q.WriteString("> " + l + "\n")
+			}
+			quote = "On " + orig.Date + ", " + orig.From + " wrote:\n" + q.String()
+		}
+	}
+	if sig := strings.TrimSpace(signature); sig != "" && !d.NoSignature {
+		d.Body = strings.TrimRight(d.Body, "\n") + "\n\n-- \n" + sig
+		if d.HTMLBody != "" {
+			d.HTMLBody += "<br><br>-- <br>" + strings.ReplaceAll(html.EscapeString(sig), "\n", "<br>")
+		}
+	}
+	if quote != "" {
+		d.Body = strings.TrimRight(d.Body, "\n") + "\n\n" + quote
 	}
 	return compose(s, d, inReplyTo, refs)
+}
+
+// othersOf lists the addresses in lists (From, To, Cc of the original) that are neither the user nor
+// already among the recipients.
+func othersOf(own string, already []string, lists ...string) []string {
+	have := map[string]bool{strings.ToLower(own): true}
+	for _, a := range already {
+		if as, err := netmail.ParseAddressList(a); err == nil {
+			for _, x := range as {
+				have[strings.ToLower(x.Address)] = true
+			}
+		}
+	}
+	var out []string
+	for _, l := range lists {
+		as, err := netmail.ParseAddressList(l)
+		if err != nil {
+			continue
+		}
+		for _, x := range as {
+			if k := strings.ToLower(x.Address); !have[k] {
+				have[k] = true
+				out = append(out, x.String())
+			}
+		}
+	}
+	return out
+}
+
+func signatureOf(h host) string {
+	var cfg struct {
+		Signature string `json:"signature"`
+	}
+	_ = h.Config(&cfg)
+	return cfg.Signature
 }
 
 func preview(s Settings, m *composed, body string) map[string]string {
@@ -547,7 +674,7 @@ func (x *integration) send(h host, m mailPayload, track bool) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := sendMail(s.SMTPAddr, s.Address, pw, s.Address, m.Envelope, raw); err != nil {
+	if err := sendMail(s.SMTPAddr, s.user(), pw, s.Address, m.Envelope, raw); err != nil {
 		return nil, err
 	}
 	m.dropStash()

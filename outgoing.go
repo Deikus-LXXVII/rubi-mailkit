@@ -159,7 +159,21 @@ func decodeB64(s string) ([]byte, error) {
 
 // writeBody writes the Content-Type headers and body: plain text, plus the HTML version and attachments
 // when there are any.
-func writeBody(b *bytes.Buffer, text, htmlBody string, files []outFile) error {
+func writeBody(b *bytes.Buffer, text, htmlBody, calendar string, files []outFile) error {
+	if calendar != "" { // a reply to an invitation: the text and the iTIP part side by side
+		alt := boundary()
+		b.WriteString("Content-Type: multipart/alternative; boundary=\"" + alt + "\"\r\n\r\n")
+		b.WriteString("--" + alt + "\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n")
+		if err := writeQP(b, text); err != nil {
+			return err
+		}
+		b.WriteString("\r\n--" + alt + "\r\nContent-Type: text/calendar; charset=utf-8; method=REPLY\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n")
+		if err := writeQP(b, calendar); err != nil {
+			return err
+		}
+		b.WriteString("\r\n--" + alt + "--\r\n")
+		return nil
+	}
 	if htmlBody == "" && len(files) == 0 {
 		b.WriteString("Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n")
 		return writeQP(b, text)
@@ -295,6 +309,7 @@ type forwardIn struct {
 	WithoutAttachments bool     `json:"without_attachments,omitempty" jsonschema:"leave its attachments out"`
 	DraftOnly          bool     `json:"draft_only,omitempty" jsonschema:"save it as a draft instead of sending"`
 	TrackDays          int      `json:"track_days,omitempty" jsonschema:"days to watch for replies if the user picks 'Send and notify on reply' (default 14, max 60)"`
+	SendAt             string   `json:"send_at,omitempty" jsonschema:"send later: 2026-10-12 09:00, an RFC 3339 time, or 3h / 2d"`
 	Account            string   `json:"account,omitempty" jsonschema:"which connected mailbox (its address); default: the default one"`
 }
 
@@ -374,6 +389,9 @@ func (x *integration) forward(ctx context.Context, h host, in forwardIn) (any, e
 		}
 		res, _ = r.(map[string]any)
 	} else {
+		if msg.sendAt, err = sendTime(in.SendAt); err != nil {
+			return nil, err
+		}
 		r, err := x.askSend(ctx, h, s, msg, d.Body, in.TrackDays, 0)
 		if err != nil {
 			return nil, err
@@ -428,14 +446,21 @@ func (x *integration) askSend(ctx context.Context, h host, s Settings, msg *comp
 	}
 	days = min(max(days, 1), 60)
 	p := payloadOf(msg, days)
-	p.DraftUID = draftUID
+	p.DraftUID, p.SendAt = draftUID, msg.sendAt
 	if err := stash(&p); err != nil {
 		return nil, err
+	}
+	pv := preview(s, msg, body)
+	if !msg.sendAt.IsZero() {
+		pv["send_at"] = msg.sendAt.Local().Format("Mon 2 Jan 2006 15:04")
+	}
+	if w := x.newRecipients(h, s, msg); w != "" {
+		pv["warning"] = w
 	}
 	return h.Submit(ctx, rubiplugin.Request{Kind: kindSend,
 		Summary:  "Send email to " + msg.to + ": \"" + msg.subject + "\"",
 		Question: "Notify you when a reply arrives?",
-		Preview:  preview(s, msg, body),
+		Preview:  pv,
 		Options:  sendOptions,
 		Payload:  p})
 }

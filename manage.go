@@ -58,33 +58,35 @@ type folderOpIn struct {
 
 // manageOp is one organizing action, as approved and as run.
 type manageOp struct {
-	Op      string   `json:"op"` // move | label | mark | undo | folder
-	Mailbox string   `json:"mailbox,omitempty"`
-	UIDs    []uint32 `json:"uids,omitempty"`
-	To      string   `json:"to,omitempty"`
-	Add     []string `json:"add,omitempty"`
-	Remove  []string `json:"remove,omitempty"`
-	As      string   `json:"as,omitempty"`
-	UndoID  string   `json:"undo_id,omitempty"`
-	Folder  string   `json:"folder_op,omitempty"`
-	Name    string   `json:"name,omitempty"`
-	NewName string   `json:"new_name,omitempty"`
+	Op      string    `json:"op"` // move | label | mark | undo | folder
+	Mailbox string    `json:"mailbox,omitempty"`
+	UIDs    []uint32  `json:"uids,omitempty"`
+	To      string    `json:"to,omitempty"`
+	Add     []string  `json:"add,omitempty"`
+	Remove  []string  `json:"remove,omitempty"`
+	As      string    `json:"as,omitempty"`
+	UndoID  string    `json:"undo_id,omitempty"`
+	Folder  string    `json:"folder_op,omitempty"`
+	Name    string    `json:"name,omitempty"`
+	NewName string    `json:"new_name,omitempty"`
+	Until   time.Time `json:"until,omitzero"`
 }
 
 // undoRec says how to reverse one action.
 type undoRec struct {
-	ID       string    `json:"id"`
-	Created  time.Time `json:"created"`
-	Op       string    `json:"op"` // move | copy | label | mark | folder_create | folder_rename
-	From     string    `json:"from,omitempty"`
-	To       string    `json:"to,omitempty"`
-	IDs      []string  `json:"ids,omitempty"`       // Message-IDs
-	DestUIDs []uint32  `json:"dest_uids,omitempty"` // where moved messages landed, when the server said
-	UIDs     []uint32  `json:"uids,omitempty"`
-	As       string    `json:"as,omitempty"`
-	Added    []string  `json:"added,omitempty"`
-	Removed  []string  `json:"removed,omitempty"`
-	Used     bool      `json:"used,omitempty"`
+	ID       string     `json:"id"`
+	Created  time.Time  `json:"created"`
+	Op       string     `json:"op"` // move | copy | label | mark | folder_create | folder_rename
+	From     string     `json:"from,omitempty"`
+	To       string     `json:"to,omitempty"`
+	IDs      []string   `json:"ids,omitempty"`       // Message-IDs
+	DestUIDs []uint32   `json:"dest_uids,omitempty"` // where moved messages landed, when the server said
+	UIDs     []uint32   `json:"uids,omitempty"`
+	As       string     `json:"as,omitempty"`
+	Added    []string   `json:"added,omitempty"`
+	Removed  []string   `json:"removed,omitempty"`
+	Used     bool       `json:"used,omitempty"`
+	Parts    []*undoRec `json:"parts,omitempty"` // a bulk action: several folders
 }
 
 const (
@@ -157,7 +159,7 @@ func (op manageOp) kind() string {
 // manage checks an action and runs it, or asks the user first if they require that.
 func (x *integration) manage(ctx context.Context, h host, op manageOp) (any, error) {
 	switch op.Op {
-	case "move", "label", "mark":
+	case "move", "label", "mark", "snooze":
 		if len(op.UIDs) == 0 {
 			return nil, errNoUIDs
 		}
@@ -271,6 +273,8 @@ func (x *integration) describeManage(h host, op manageOp) (string, map[string]an
 	case "label":
 		pv["add"], pv["remove"] = strings.Join(op.Add, ", "), strings.Join(op.Remove, ", ")
 		return "Change the labels of " + n, pv, nil
+	case "snooze":
+		return "Snooze " + n + " until " + op.Until.Local().Format("Mon 2 Jan 15:04"), pv, nil
 	}
 	return "Mark " + n + " as " + op.As, pv, nil
 }
@@ -366,6 +370,9 @@ func (x *integration) doManage(h host, op manageOp) (any, error) {
 		rec, err = markTargets(c, box, targets, op.As)
 	case "label":
 		rec, err = x.labelTargets(c, sp, box, targets, op.Add, op.Remove)
+	case "snooze":
+		rec, err = x.snooze(h, c, sp, box, targets, op.Until)
+		out["until"] = op.Until.Format(time.RFC3339)
 	default:
 		return nil, fmt.Errorf("unknown action %q", op.Op)
 	}
@@ -610,21 +617,43 @@ func (x *integration) undo(h host, c *imapclient.Client, sp specials, id string)
 		return nil, err
 	}
 	out := map[string]any{"status": "undone"}
+	parts := []*undoRec{rec}
+	if rec.Op == "multi" {
+		parts = rec.Parts
+	}
+	var failed []string
+	for _, p := range parts {
+		if err := undoOne(c, sp, p, out); err != nil {
+			if len(parts) == 1 {
+				return nil, err
+			}
+			failed = append(failed, err.Error())
+		}
+	}
+	if len(failed) > 0 {
+		out["status"], out["failed"] = "partly_undone", failed
+	}
+	h.Audit("mail_undo", map[string]any{"op": rec.Op})
+	return out, nil
+}
+
+func undoOne(c *imapclient.Client, sp specials, rec *undoRec, out map[string]any) error {
+	var err error
 	switch rec.Op {
 	case "move", "copy":
 		set := imap.UIDSet{}
 		if len(rec.DestUIDs) > 0 {
 			if _, err := c.Select(rec.To, nil).Wait(); err != nil {
-				return nil, err
+				return err
 			}
 			for _, u := range rec.DestUIDs {
 				set.AddNum(imap.UID(u))
 			}
 		} else if set, err = findByID(c, rec.To, rec.IDs, false); err != nil {
-			return nil, err
+			return err
 		}
 		if len(set) == 0 {
-			return nil, errors.New("the messages aren't in " + rec.To + " any more")
+			return errors.New("the messages aren't in " + rec.To + " any more")
 		}
 		switch {
 		case rec.Op == "copy": // Gmail: the label was added; remove it again
@@ -638,7 +667,7 @@ func (x *integration) undo(h host, c *imapclient.Client, sp specials, id string)
 			_, err = c.Move(set, rec.From).Wait()
 		}
 		if err != nil {
-			return nil, fmt.Errorf("couldn't undo: %w", err)
+			return fmt.Errorf("couldn't undo: %w", err)
 		}
 		out["mailbox"] = rec.From
 	case "mark":
@@ -648,12 +677,12 @@ func (x *integration) undo(h host, c *imapclient.Client, sp specials, id string)
 			ts = append(ts, target{uid: imap.UID(u), seen: opposite == "unread", starred: opposite == "unstarred"})
 		}
 		if _, err := markTargets(c, rec.From, ts, opposite); err != nil {
-			return nil, err
+			return err
 		}
 	case "label":
 		for _, l := range rec.Added {
 			if err := removeByID(c, l, rec.IDs); err != nil {
-				return nil, fmt.Errorf("couldn't undo: %w", err)
+				return fmt.Errorf("couldn't undo: %w", err)
 			}
 		}
 		for _, l := range rec.Removed {
@@ -663,25 +692,24 @@ func (x *integration) undo(h host, c *imapclient.Client, sp specials, id string)
 			}
 			set, err := findByID(c, src, rec.IDs, true)
 			if err != nil {
-				return nil, err
+				return err
 			}
 			if len(set) > 0 {
 				if _, err := c.Copy(set, l).Wait(); err != nil {
-					return nil, fmt.Errorf("couldn't undo: %w", err)
+					return fmt.Errorf("couldn't undo: %w", err)
 				}
 			}
 		}
 	case "folder_create":
 		if err := deleteEmptyFolder(c, rec.To); err != nil {
-			return nil, err
+			return err
 		}
 	case "folder_rename":
 		if err := c.Rename(rec.To, rec.From, nil).Wait(); err != nil {
-			return nil, fmt.Errorf("couldn't rename it back: %w", err)
+			return fmt.Errorf("couldn't rename it back: %w", err)
 		}
 	}
-	h.Audit("mail_undo", map[string]any{"op": rec.Op})
-	return out, nil
+	return nil
 }
 
 // ---- folders ----

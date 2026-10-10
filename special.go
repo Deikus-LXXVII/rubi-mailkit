@@ -189,7 +189,11 @@ func (x *integration) querySearch(h host, c *imapclient.Client, s Settings, q se
 		if err != nil {
 			return nil, content, err
 		}
-		uids, err := rawSearch(s, pw, box, query)
+		limit := q.limit()
+		if q.max > 0 {
+			limit = 0 // a bulk action needs no labels
+		}
+		uids, meta, err := gmailLookup(s, pw, box, query, nil, limit)
 		if err != nil {
 			return nil, content, err
 		}
@@ -197,6 +201,7 @@ func (x *integration) querySearch(h host, c *imapclient.Client, s Settings, q se
 			return nil, content, fmt.Errorf("can't open folder %q: %w", box, err)
 		}
 		msgs, err = fetchSummaries(c, box, uids, q.limit())
+		withMeta(msgs, meta)
 		return msgs, content, err
 	}
 	if perr != nil {
@@ -254,3 +259,30 @@ func sortNewest(msgs []summary) {
 }
 
 var errNoUIDs = errors.New("give uid or uids")
+
+// withMeta adds Gmail's labels and conversation to messages.
+func withMeta(msgs []summary, meta map[imap.UID]gmMeta) {
+	for i := range msgs {
+		if m, ok := meta[imap.UID(msgs[i].UID)]; ok {
+			msgs[i].Labels, msgs[i].info.thread = m.Labels, m.Thread
+		}
+	}
+}
+
+// gmailMeta fetches labels and conversations for messages found without Gmail's search.
+func gmailMeta(h host, s Settings, box string, msgs []summary) {
+	if !prov.Gmail || len(msgs) == 0 {
+		return
+	}
+	pw, err := h.Secret("app_password")
+	if err != nil {
+		return
+	}
+	uids := make([]imap.UID, len(msgs))
+	for i, m := range msgs {
+		uids[i] = imap.UID(m.UID)
+	}
+	if _, meta, err := gmailLookup(s, pw, box, "", uids, len(uids)); err == nil {
+		withMeta(msgs, meta)
+	}
+}

@@ -286,6 +286,7 @@ func parseAge(v string, now time.Time) (time.Time, error) {
 
 // threadInfo is what grouping needs about a message; summary carries it unexported.
 type threadInfo struct {
+	thread    string // Gmail's conversation id, when known
 	messageID string
 	parents   []string // In-Reply-To and References
 	subject   string
@@ -327,6 +328,16 @@ func groupThreads(msgs []summary) []thread {
 	union := func(a, b int) {
 		if ra, rb := find(a), find(b); ra != rb {
 			parent[rb] = ra
+		}
+	}
+	byThread := map[string]int{}
+	for i, m := range msgs {
+		if m.info.thread != "" {
+			if j, ok := byThread[m.info.thread]; ok {
+				union(j, i)
+			} else {
+				byThread[m.info.thread] = i
+			}
 		}
 	}
 	byID := map[string]int{}

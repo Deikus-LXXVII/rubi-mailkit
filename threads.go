@@ -85,8 +85,20 @@ func (x *integration) doThread(h host, in threadIn) (any, error) {
 	}
 	var hits []found
 	seen := map[string]bool{}
+	var gmUIDs []imap.UID
+	if prov.Gmail && len(boxes) == 1 && boxes[0] == sp.All {
+		if pw, err := h.Secret("app_password"); err == nil {
+			gmUIDs, _ = gmailThread(s, pw, in.Mailbox, imap.UID(in.UID), sp.All)
+		}
+	}
 	for _, box := range boxes {
 		uids, err := threadUIDs(c, box, ids)
+		if len(gmUIDs) > 0 { // Gmail knows the conversation exactly
+			uids, err = gmUIDs, nil
+			if _, e := c.Select(box, &imap.SelectOptions{ReadOnly: true}).Wait(); e != nil {
+				err = e
+			}
+		}
 		if err != nil {
 			continue
 		}

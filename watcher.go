@@ -42,7 +42,10 @@ type state struct {
 	Watches []*watch          `json:"watches,omitempty"`
 	Grants  []*grant          `json:"grants,omitempty"` // temporary folder access the user approved
 	Cursors map[string]cursor `json:"cursors"`
-	Undo    []*undoRec        `json:"undo,omitempty"` // how to reverse recent changes to the mailbox
+	Undo    []*undoRec        `json:"undo,omitempty"`    // how to reverse recent changes to the mailbox
+	Queued  []*queued         `json:"queued,omitempty"`  // approved emails waiting to go out
+	Snoozed []*snoozed        `json:"snoozed,omitempty"` // mail put away until a time
+	Rules   []*rule           `json:"rules,omitempty"`   // what to do with new mail, set by the user
 }
 
 func (s *state) active(now time.Time) []*tracked {
@@ -143,8 +146,9 @@ func (x *integration) Start(b base) error {
 		return err
 	}
 	interval := time.Duration(max(s.WatchIntervalSeconds, 30)) * time.Second
-	x.stop, x.pollNow = make(chan struct{}), make(chan struct{}, 1)
+	x.stop, x.pollNow, x.jobsNow = make(chan struct{}), make(chan struct{}, 1), make(chan struct{}, 1)
 	go x.loop(b, interval, x.stop, x.pollNow)
+	go x.jobsLoop(b, x.stop, x.jobsNow)
 	return nil
 }
 
@@ -153,7 +157,7 @@ func (x *integration) Stop() {
 	defer x.mu.Unlock()
 	if x.stop != nil {
 		close(x.stop)
-		x.stop, x.pollNow = nil, nil
+		x.stop, x.pollNow, x.jobsNow = nil, nil, nil
 	}
 }
 
@@ -196,7 +200,7 @@ func (x *integration) poll(h host) error {
 	now := time.Now()
 	active := st.active(now)
 	watches := st.activeWatches(now)
-	if len(active) == 0 && len(watches) == 0 {
+	if len(active) == 0 && len(watches) == 0 && len(st.Rules) == 0 {
 		return nil // nothing to follow: the server isn't contacted
 	}
 	if x.folderAllowed(h, "INBOX") != nil {
@@ -237,9 +241,37 @@ func (x *integration) poll(h host) error {
 		return err
 	}
 	texts := 0
+	var sp *specials
+	ruleWords := false
+	for _, r := range st.Rules {
+		ruleWords = ruleWords || len(r.Words) > 0
+	}
 	for _, hd := range headers {
 		private, _ := p.hidden(hd.from, hd.subject, "")
 		x.checkWatches(h, c, box, st, hd, private, needText, &texts, now)
+		if len(st.Rules) > 0 {
+			if sp == nil {
+				found, err := findSpecials(c, s)
+				if err != nil {
+					return err
+				}
+				sp = &found
+			}
+			text := ""
+			if ruleWords && !private && texts < maxTextsPerPoll {
+				texts++
+				if raw, err := fetchRaw(c, box, hd.uid); err == nil {
+					if m, err := parseMessage(raw, 20000); err == nil {
+						if hidden, _ := p.hidden(hd.from, hd.subject, m.Text); hidden {
+							private = true
+						} else {
+							text = m.Text
+						}
+					}
+				}
+			}
+			x.applyRules(h, c, sp, box, st, hd, private, text, now)
+		}
 		t, how := match(hd, st.active(now), s.Address)
 		if t == nil {
 			continue

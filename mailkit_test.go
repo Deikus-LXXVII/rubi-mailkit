@@ -75,6 +75,13 @@ func startIMAP(t *testing.T) string {
 		}
 		return imapclient.New(conn, nil), nil
 	}
+	dialIdle = func(addr string, o *imapclient.Options) (*imapclient.Client, error) {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		return imapclient.New(conn, o), nil
+	}
 	return ln.Addr().String()
 }
 

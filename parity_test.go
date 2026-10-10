@@ -214,17 +214,21 @@ func TestGmailQuery(t *testing.T) {
 	deliver(t, addr, "[Gmail]/All Mail", "From: shop@example.com\nSubject: Sale\nMessage-ID: <s1@example.com>\n\nsale\n")
 	deliver(t, addr, "[Gmail]/All Mail", "From: anna@example.com\nSubject: Hi\nMessage-ID: <a1@example.com>\n\nhi\n")
 	var box, query string
-	rawSearch = func(_ Settings, pw, b, q string) ([]imap.UID, error) {
+	gmailLookup = func(_ Settings, pw, b, q string, uids []imap.UID, limit int) ([]imap.UID, map[imap.UID]gmMeta, error) {
+		if q == "" { // labels for a plain search
+			return uids, map[imap.UID]gmMeta{2: {Thread: "77", Labels: []string{"INBOX", "Work"}}}, nil
+		}
 		box, query = b, q
-		return []imap.UID{1}, nil
+		return []imap.UID{1}, map[imap.UID]gmMeta{1: {Thread: "55", Labels: []string{"Promotions"}}}, nil
 	}
-	defer func() { rawSearch = gmailRawSearch }()
+	defer func() { gmailLookup = gmailLookupRaw }()
 	res, err := x.doRead(h, readPayload{Op: "search", Search: &searchQuery{Query: "category:promotions", UnseenOnly: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := asMap(t, res)["messages"].([]any)
-	if box != "[Gmail]/All Mail" || query != "category:promotions is:unread" || len(got) != 1 || got[0].(map[string]any)["subject"] != "Sale" {
+	if box != "[Gmail]/All Mail" || query != "category:promotions is:unread" || len(got) != 1 || got[0].(map[string]any)["subject"] != "Sale" ||
+		got[0].(map[string]any)["labels"].([]any)[0] != "Promotions" {
 		t.Fatalf("box=%q query=%q %v", box, query, got)
 	}
 

@@ -36,7 +36,11 @@ type Settings struct {
 	Sent                 string `json:"sent"`
 	WatchIntervalSeconds int    `json:"watch_interval_seconds"`
 	TrackDays            int    `json:"track_days"`
+	Username             string `json:"username,omitempty"` // when the server's login isn't the address
 }
+
+// user is the login name.
+func (s Settings) user() string { return orDefault(s.Username, s.Address) }
 
 // The provider's servers (set by use; tests point them elsewhere).
 var (
@@ -51,12 +55,14 @@ func defaultSettings() Settings {
 
 // Seams for tests.
 var (
-	dialIMAP = func(addr string) (*imapclient.Client, error) {
+	dialIMAP = func(addr string) (*imapclient.Client, error) { return dialIdle(addr, nil) }
+	// dialIdle connects with options (the IDLE connection listens for new mail).
+	dialIdle = func(addr string, o *imapclient.Options) (*imapclient.Client, error) {
 		conn, err := dialTLS(addr)
 		if err != nil {
 			return nil, err
 		}
-		return imapclient.New(conn, nil), nil
+		return imapclient.New(conn, o), nil
 	}
 	// dialRaw opens a plain connection to the IMAP server for commands go-imap doesn't speak (Gmail's
 	// X-GM-RAW search).
@@ -99,7 +105,7 @@ func login(s Settings, password string) (*imapclient.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("can't reach %s: %w", prov.Name, err)
 	}
-	if err := c.Login(s.Address, password).Wait(); err != nil {
+	if err := c.Login(s.user(), password).Wait(); err != nil {
 		c.Close()
 		return nil, authError{}
 	}
@@ -124,17 +130,28 @@ func smtpSend(addr, user, password, from string, to []string, msg []byte) error 
 		return fmt.Errorf("can't reach the %s server: %w", prov.Name, err)
 	}
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Minute))
+	implicit := strings.HasSuffix(addr, ":465") // TLS from the start (port 465) rather than STARTTLS
+	if implicit {
+		tc := tls.Client(conn, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+		if err := tc.Handshake(); err != nil {
+			conn.Close()
+			return err
+		}
+		conn = tc
+	}
 	c, err := smtp.NewClient(conn, host)
 	if err != nil {
 		conn.Close()
 		return err
 	}
 	defer c.Close()
-	if ok, _ := c.Extension("STARTTLS"); !ok {
-		return errors.New("the mail server doesn't offer encryption; refusing to send")
-	}
-	if err := c.StartTLS(&tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}); err != nil {
-		return err
+	if !implicit {
+		if ok, _ := c.Extension("STARTTLS"); !ok {
+			return errors.New("the mail server doesn't offer encryption; refusing to send")
+		}
+		if err := c.StartTLS(&tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}); err != nil {
+			return err
+		}
 	}
 	if err := c.Auth(smtp.PlainAuth("", user, password, host)); err != nil {
 		return authError{}
@@ -221,19 +238,22 @@ type searchQuery struct {
 	UnseenOnly bool   `json:"unseen_only,omitempty"`
 	Limit      int    `json:"limit,omitempty" jsonschema:"max results, default 20, max 50"`
 	Account    string `json:"account,omitempty" jsonschema:"which connected mailbox (its address); default: the default one"`
+
+	max int // a bulk action: up to this many matches instead of Limit
 }
 
 type summary struct {
-	UID     uint32 `json:"uid"`
-	Mailbox string `json:"mailbox,omitempty"`
-	Date    string `json:"date,omitempty"`
-	From    string `json:"from"`
-	To      string `json:"to,omitempty"`
-	Subject string `json:"subject"`
-	Seen    bool   `json:"seen"`
-	Starred bool   `json:"starred,omitempty"`
-	Private bool   `json:"private,omitempty"` // hidden by the user's privacy filter: only the sender is shown
-	Thread  int    `json:"thread,omitempty"`  // which of the threads it belongs to (1 = the first)
+	UID     uint32   `json:"uid"`
+	Mailbox string   `json:"mailbox,omitempty"`
+	Date    string   `json:"date,omitempty"`
+	From    string   `json:"from"`
+	To      string   `json:"to,omitempty"`
+	Subject string   `json:"subject"`
+	Seen    bool     `json:"seen"`
+	Starred bool     `json:"starred,omitempty"`
+	Labels  []string `json:"labels,omitempty"`  // Gmail
+	Private bool     `json:"private,omitempty"` // hidden by the user's privacy filter: only the sender is shown
+	Thread  int      `json:"thread,omitempty"`  // which of the threads it belongs to (1 = the first)
 
 	info threadInfo
 }
@@ -247,6 +267,9 @@ func search(c *imapclient.Client, q searchQuery) ([]summary, error) {
 }
 
 func (q searchQuery) limit() int {
+	if q.max > 0 {
+		return q.max
+	}
 	if q.Limit <= 0 {
 		return 20
 	}
@@ -391,8 +414,12 @@ type message struct {
 	Unsubscribe []string `json:"unsubscribe,omitempty"`
 	OneClick    bool     `json:"unsubscribe_one_click,omitempty"`
 	HasHTML     bool     `json:"has_formatted_version,omitempty"`
-	Note        string   `json:"note"`
-	html        string   // the HTML body, for format "html"
+	// Security: whether the receiving server confirmed the sender, and phishing signs.
+	Security *security `json:"security,omitempty"`
+	// Invite is a calendar invitation the email carries.
+	Invite *invite `json:"invite,omitempty"`
+	Note   string  `json:"note"`
+	html   string  // the HTML body, for format "html"
 }
 
 type attachment struct {
@@ -442,15 +469,25 @@ func parseMessage(raw []byte, maxChars int) (*message, error) {
 			case ct == "text/html" && htmlText == "":
 				m.html = string(body)
 				htmlText = htmlToText(m.html)
+			case ct == "text/calendar" && m.Invite == nil:
+				m.Invite = parseInvite(body)
 			}
 		case *mail.AttachmentHeader:
 			name, _ := ph.Filename()
 			ct, _, _ := ph.ContentType()
+			if (ct == "text/calendar" || strings.HasSuffix(strings.ToLower(name), ".ics")) && m.Invite == nil {
+				body, _ := io.ReadAll(io.LimitReader(p.Body, 256<<10))
+				m.Invite = parseInvite(body)
+				p.Body = bytes.NewReader(nil)
+				m.Attachments = append(m.Attachments, attachment{Filename: name, ContentType: ct, Size: len(body)})
+				continue
+			}
 			n, _ := io.Copy(io.Discard, io.LimitReader(p.Body, 100<<20))
 			m.Attachments = append(m.Attachments, attachment{Filename: name, ContentType: ct, Size: int(n)})
 		}
 	}
 	m.HasHTML = m.html != ""
+	m.Security = checkSecurity(h, m.From, m.html)
 	m.Text = plain
 	if m.Text == "" {
 		m.Text = htmlText
@@ -508,19 +545,23 @@ func htmlToText(s string) string {
 // ---- composing ----
 
 type draft struct {
-	To         []string `json:"to"`
-	Cc         []string `json:"cc,omitempty"`
-	Bcc        []string `json:"bcc,omitempty"`
-	Subject    string   `json:"subject"`
-	Body       string   `json:"body"`
-	ReplyToUID uint32   `json:"reply_to_uid,omitempty" jsonschema:"uid of the message being answered (sets threading headers)"`
-	ReplyBox   string   `json:"reply_mailbox,omitempty" jsonschema:"folder of that message, default INBOX"`
-	HTMLBody   string   `json:"html_body,omitempty" jsonschema:"optional formatted version (HTML); body stays the plain-text version"`
+	To          []string `json:"to"`
+	Cc          []string `json:"cc,omitempty"`
+	Bcc         []string `json:"bcc,omitempty"`
+	Subject     string   `json:"subject"`
+	Body        string   `json:"body"`
+	ReplyToUID  uint32   `json:"reply_to_uid,omitempty" jsonschema:"uid of the message being answered (sets threading headers)"`
+	ReplyBox    string   `json:"reply_mailbox,omitempty" jsonschema:"folder of that message, default INBOX"`
+	HTMLBody    string   `json:"html_body,omitempty" jsonschema:"optional formatted version (HTML); body stays the plain-text version"`
+	ReplyAll    bool     `json:"reply_all,omitempty" jsonschema:"with reply_to_uid: also to everyone else on the original"`
+	Quote       bool     `json:"quote,omitempty" jsonschema:"with reply_to_uid: quote the original under your text"`
+	NoSignature bool     `json:"no_signature,omitempty" jsonschema:"leave out the user's signature"`
 	// Attachments are files from the agent or attachments of other emails.
 	Attachments []attachIn `json:"attachments,omitempty" jsonschema:"files to attach: content_base64 from you (2 MB in all), or an attachment of another email (from_uid and index, up to 20 MB)"`
 	Account     string     `json:"account,omitempty" jsonschema:"which connected mailbox (its address); default: the default one"`
 
-	files []outFile // the attachments, resolved
+	files    []outFile // the attachments, resolved
+	calendar string    // an iTIP reply (respond_invite)
 }
 
 type composed struct {
@@ -532,6 +573,7 @@ type composed struct {
 	subject   string
 	inReplyTo string
 	files     []outFile
+	sendAt    time.Time
 }
 
 func parseList(list []string) ([]*netmail.Address, error) {
@@ -570,7 +612,7 @@ func compose(s Settings, d draft, inReplyTo, references string) (*composed, erro
 	if err != nil {
 		return nil, err
 	}
-	if len(to) == 0 {
+	if len(to)+len(cc)+len(bcc) == 0 {
 		return nil, errors.New("at least one recipient is required")
 	}
 	if n := len(to) + len(cc) + len(bcc); n > 20 {
@@ -604,7 +646,7 @@ func compose(s Settings, d draft, inReplyTo, references string) (*composed, erro
 	hdr("In-Reply-To", inReplyTo)
 	hdr("References", strings.TrimSpace(references+" "+inReplyTo))
 	hdr("MIME-Version", "1.0")
-	if err := writeBody(&b, d.Body, d.HTMLBody, d.files); err != nil {
+	if err := writeBody(&b, d.Body, d.HTMLBody, d.calendar, d.files); err != nil {
 		return nil, err
 	}
 

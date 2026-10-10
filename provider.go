@@ -46,6 +46,12 @@ type Provider struct {
 	// Gmail is true for Gmail's servers: searches run with Gmail's own search (X-GM-RAW), and labels are
 	// managed as Gmail exposes them over IMAP (a label is a folder; a message can be in several).
 	Gmail bool
+	// CustomServers: the user enters the IMAP and SMTP servers (or a known service fills them in);
+	// IMAPAddr and SMTPAddr are then unused.
+	CustomServers bool
+	// AuthServIDs are the servers whose Authentication-Results are trusted (e.g. "google.com" covers
+	// mx.google.com); empty: the topmost such header.
+	AuthServIDs []string
 	// MailDomain is used in Message-IDs when the address has none.
 	MailDomain string
 	// AuthError is shown when the server rejects the login.
@@ -59,7 +65,7 @@ const PublisherKey = "MCowBQYDK2VwAyEAxeDfKAkO77JdARN7Y2jJT3tXw9mN+GqqH8R5mhcxt8
 var prov Provider
 
 var kindRead, kindDraft, kindSend, kindWatch, kindPrivate, kindFolder, kindAttachment string
-var kindOrganize, kindFolders, kindFolderDelete string
+var kindOrganize, kindFolders, kindFolderDelete, kindRules, kindUnsubscribe, kindBulk string
 
 func use(p Provider) {
 	if p.CleanPassword == nil {
@@ -70,6 +76,7 @@ func use(p Provider) {
 	kindWatch, kindPrivate, kindFolder = p.ID+".watch", p.ID+".private", p.ID+".folder"
 	kindAttachment = p.ID + ".attachment"
 	kindOrganize, kindFolders, kindFolderDelete = p.ID+".organize", p.ID+".folders", p.ID+".folder_delete"
+	kindRules, kindUnsubscribe, kindBulk = p.ID+".rules", p.ID+".unsubscribe", p.ID+".bulk"
 	defaultIMAPAddr, defaultSMTPAddr = p.IMAPAddr, p.SMTPAddr
 }
 
@@ -89,6 +96,16 @@ var sendOptions = []rubiplugin.Option{
 
 func manifest() rubiplugin.Manifest {
 	p := prov
+	fields := []rubiplugin.Field{
+		{Key: "address", Label: p.AddressLabel, Type: "email", Placeholder: p.AddressPlaceholder, Required: true, Help: p.AddressHelp},
+		{Key: "from_name", Label: "Your name (shown to recipients)", Type: "text", Placeholder: "Optional"},
+	}
+	egress := []string{p.IMAPAddr, p.SMTPAddr}
+	if p.CustomServers {
+		fields = append(fields, customFields...)
+		egress = []string{"the IMAP and SMTP servers of your mail service"}
+	}
+	egress = append(egress, "unsubscribe links of mailing lists (https, each one you approve)")
 	return rubiplugin.Manifest{
 		ID:          p.ID,
 		Name:        p.Name,
@@ -99,10 +116,8 @@ func manifest() rubiplugin.Manifest {
 		Source:      p.Source,
 		MinRubi:     p.MinRubi,
 		Entry:       p.ID,
-		Fields: []rubiplugin.Field{
-			{Key: "address", Label: p.AddressLabel, Type: "email", Placeholder: p.AddressPlaceholder, Required: true, Help: p.AddressHelp},
-			{Key: "from_name", Label: "Your name (shown to recipients)", Type: "text", Placeholder: "Optional"},
-		},
+		Fields:      fields,
+		Panel:       "view",
 		Secrets: []rubiplugin.Secret{{Key: "app_password", Label: p.PasswordLabel, Help: p.PasswordHelp,
 			HelpURL: p.PasswordURL, HelpLink: p.PasswordLink}},
 		Actions: []rubiplugin.Action{
@@ -113,6 +128,9 @@ func manifest() rubiplugin.Manifest {
 			{Kind: kindOrganize, Title: organizeTitle(), DefaultLevel: rubiplugin.None},
 			{Kind: kindFolders, Title: "Create and rename " + folderWord() + "s", DefaultLevel: rubiplugin.None},
 			{Kind: kindFolderDelete, Title: "Delete a " + folderWord(), DefaultLevel: rubiplugin.Strong},
+			{Kind: kindBulk, Title: "Organize many emails at once (found by a search; can be undone)", DefaultLevel: rubiplugin.Chat},
+			{Kind: kindRules, Title: "Add or remove rules for new mail", DefaultLevel: rubiplugin.Strong},
+			{Kind: kindUnsubscribe, Title: "Unsubscribe from a mailing list", DefaultLevel: rubiplugin.Chat},
 			{Kind: kindPrivate, Title: "Show a private email", DefaultLevel: rubiplugin.Strong, Locked: true,
 				Options: []rubiplugin.Option{{Key: "show", Label: "Show it to my agent"}}},
 			{Kind: kindFolder, Title: "Open a closed folder for a while", DefaultLevel: rubiplugin.Strong, Locked: true},
@@ -122,8 +140,11 @@ func manifest() rubiplugin.Manifest {
 		Events: []rubiplugin.EventType{
 			{Type: "reply", Untrusted: []string{"reply.from", "reply.subject"}},
 			{Type: "watch", Untrusted: []string{"message.from", "message.subject", "message.snippet"}},
+			{Type: "rule", Untrusted: []string{"message.from", "message.subject"}},
+			{Type: "snooze", Untrusted: []string{"from", "subject"}},
+			{Type: "scheduled", Untrusted: []string{"subject", "to"}},
 		},
-		Config: append(append([]rubiplugin.ConfigField{}, folderSettings...), attachmentSetting,
+		Config: append(append([]rubiplugin.ConfigField{}, folderSettings...), attachmentSetting, undoSetting, signatureSetting,
 			rubiplugin.ConfigField{Key: "hide_codes", Label: "Hide sign-in codes, one-time passwords and confirmation links", Type: "bool", Default: true,
 				Help: "Built-in list, English and Russian, plus subjects like \"482913 is your code\"."},
 			rubiplugin.ConfigField{Key: "hide_password_resets", Label: "Hide password reset emails", Type: "bool", Default: true},
@@ -134,7 +155,7 @@ func manifest() rubiplugin.Manifest {
 			rubiplugin.ConfigField{Key: "hidden_keywords", Label: "Hidden words", Type: "list", Default: []string{},
 				Help: "Words or phrases, one per line. Your agent can't see mail whose subject or text contains one."},
 		),
-		Egress: []string{p.IMAPAddr, p.SMTPAddr},
+		Egress: egress,
 	}
 }
 
